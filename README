@@ -1,0 +1,15 @@
+dir=/home/brucewoo/python/test/test.log
+server=mail.360buy.com
+user=wuyouqiang@360buy.com
+password=******
+sendmail=wuyouqiang@360buy.com
+<toemaillist>
+email=wuyouqiang@360buy.com
+email=liuqingpan@360buy.com
+email=yfyangfeng@360buy.com
+</toemaillist>
+<host_port>
+host_port=10.28.0.219:1463
+host_port=10.28.1.58:1463
+host_port=10.28.1.54:1463
+</host_port>
