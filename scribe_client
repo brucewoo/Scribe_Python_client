@@ -1,0 +1,393 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import optparse
+import email
+import mimetypes
+from email.MIMEMultipart import MIMEMultipart
+from email.MIMEText import MIMEText
+from email.MIMEImage import MIMEImage
+import smtplib
+
+import os
+import sys
+import time
+import pickle
+from thrift.transport import TTransport
+from thrift.transport import TSocket
+from thrift.transport.TTransport import TTransportException
+from thrift.protocol import TBinaryProtocol
+from scribe import scribe
+
+class Error(Exception): pass
+class FileError(Error): pass
+
+def sendEmail(authInfo, fromAdd, toAdd, subject, plainText, htmlText):
+	strFrom = fromAdd
+	strTo =','.join(toAdd)
+	server = authInfo.get('server')
+	user = authInfo.get('user')
+	passwd = authInfo.get('password')
+	if not (server and user and passwd):
+		print('登录信息不完整，不能发送邮件')
+		return
+	
+	msgRoot = MIMEMultipart('related')
+	msgRoot['Subject'] = subject
+	msgRoot['From'] = strFrom
+	msgRoot['To'] = strTo
+	msgRoot.preamble = 'This is a multi-part message in MIME format.'
+
+	msgAlternative = MIMEMultipart('alternative')
+	msgRoot.attach(msgAlternative)
+
+	msgText = MIMEText(plainText, 'plain', 'utf-8')
+	msgAlternative.attach(msgText)
+#	msgText = MIMEText(htmlText, 'html', 'utf-8')
+#	msgAlternative.attach(msgText)
+
+	smtp = smtplib.SMTP()
+	smtp.set_debuglevel(1)
+	smtp.connect(server)
+	smtp.login(user, passwd)
+	smtp.sendmail(strFrom, strTo, msgRoot.as_string())
+	smtp.quit()
+	return
+
+class ScribeClient(object):
+	def __init__(self, sleep=1.0, reopen_count=5):
+		self.sleep = sleep
+		self.reopen_count = reopen_count
+
+	def __iter__(self):
+		while True:
+			pos = self.file.tell()
+			self.filelist[self.inode] = pos
+			self.serialize()
+			line = self.file.readline()
+			if not line:
+				self.wait(pos)
+			else:
+				yield line
+
+	def open(self, tail=True):
+		try:
+			self.real_path = os.path.realpath(self.path)
+			self.inode = os.stat(self.path).st_ino
+		except OSError, error:
+			raise FileError(error)
+		try:
+			self.file = open(self.real_path)
+			if not self.inode in self.filelist:
+				self.filelist[self.inode] = 0L
+				self.serialize()
+		except IOError, error:
+			raise FileError(error)
+		if tail:
+			self.file.seek(self.filelist[self.inode])
+
+	def close(self):
+		try:
+			self.file.close()
+		except Exception:
+			pass
+
+	def reopen(self):
+		self.close()
+		reopen_count = self.reopen_count
+		while reopen_count >= 0:
+			reopen_count -= 1
+			try:
+				self.open(tail=False)
+				return True
+			except FileError:
+				time.sleep(self.sleep)
+		return False
+
+	def check(self, pos):
+		try:
+			if self.real_path != os.path.realpath(self.path):
+				return True
+			stat = os.stat(self.path)
+			if self.inode != stat.st_ino:
+				return True
+			if pos > stat.st_size:
+				return True
+		except OSError:
+			return True
+		return False
+
+	def wait(self, pos):
+		if self.check(pos):
+			self.readHistoryLog()
+			if not self.reopen():
+				raise Error('Unable to reopen file: %s' % self.path)
+		else:
+			self.file.seek(pos)
+			time.sleep(self.sleep)
+
+	def readHistoryLog(self):
+		if not os.path.exists(self.config['dir']):
+			print('配置的监控文件不存在~')
+			return
+		else:
+			try:
+				dirname = os.path.dirname(self.config['dir'])
+				files = os.listdir(dirname)
+				for f in files:
+					if f.startswith('.') or os.path.isdir(f):
+						files.remove(f)
+
+				files = [os.path.join(dirname, f) for f in files]
+				files.sort(key=lambda x: os.path.getmtime(x))
+				files.reverse()
+				isAll = False
+				readlist = []
+
+				for filename in files:
+					if not cmp(filename, self.path):
+						continue
+
+					inode = os.stat(filename).st_ino
+					if inode in self.filelist:
+						filesize = os.path.getsize(filename)
+						if filesize > self.filelist[inode]:
+							readlist.append(filename)
+#							self.writeHistoryLog(filename, self.filelist[inode])
+						else:
+							isAll = True
+					else:
+						readlist.append(filename)
+						self.filelist[inode] = 0L
+#						self.writeHistoryLog(filename, 0)
+					if isAll:
+						break
+				readlist.reverse()
+				for filename in readlist:
+					inode = os.stat(filename).st_ino
+					self.writeHistoryLog(filename, self.filelist[inode])
+#				if self.start:
+#					self.start = False
+#					if isSeg:
+#						self.writeHistoryLog(self.config['dir'], 0)
+#					else:
+#						inode = os.stat(self.config['dir']).st_ino
+#						filesize = os.path.getsize(self.config['dir'])
+#						if filesize > self.filelist[inode]:
+#							self.writeHistoryLog(self.config['dir'], self.filelist[inode])
+			except OSError, error:
+				pass
+
+	def writeHistoryLog(self, filename, pos):
+		try:
+			self.category = os.path.splitext(os.path.split(filename)[1])[0]
+			inode = os.stat(filename).st_ino
+			fs = open(filename, 'r')
+			if self.writeLog(fs, pos): 
+				self.filelist[inode] = fs.tell()
+				self.serialize()
+				print('%s start: %d end: %d' % (filename, pos, fs.tell()))
+		except IOError,error:
+			print('以读模式打开文件' + filename + '失败！')
+
+	def writeLog(self, fs, pos):
+		result = False
+		logEntries = []
+
+		if not self.initScribeClient():
+			return False
+		fs.seek(pos)
+		
+		while True:
+			line = fs.readline()
+			if not line:
+				break
+			log_entry = scribe.LogEntry(category=self.category,message=line)
+			logEntries.append(log_entry)
+
+		if len(logEntries) > 0:
+			res = self.client.Log(messages=logEntries)
+			if res == scribe.ResultCode.OK:
+				result = True
+			elif res == scribe.ResultCode.TRY_LATER:
+				print('Scribe Error: TRY_LATER')
+			else:
+				print('Scribe Error: Unknown error code (%s)' % res)
+		else:
+			print('没有日志消息写入Scribe服务器!')
+		return result
+
+	def readConfig(self, filename):
+		result = True
+		self.config = {}
+		self.host_port = []
+		self.emailList = []
+		f = open(filename, 'r')
+		while True:
+			line=f.readline()
+			#去掉换行符'\n'
+			line=line[0:len(line)-1]
+			if not line or len(line)<=1:
+				break
+			if line == '<host_port>':
+				while True:
+					line=f.readline()
+					line=line[0:len(line)-1]
+					if line == '</host_port>':
+						break
+					l = line.split('=')[1].split(':')
+					if len(l) != 2:
+						print('配置文件中的IP地址和端口号配置不正确！')
+						result = False
+						break
+					self.host_port.append(HostPort(host=l[0],port=l[1]))
+			elif line == '<toemaillist>':
+				while True:
+					line=f.readline()
+					line=line[0:len(line)-1]
+					if line == '</toemaillist>':
+						break;
+					l = line.split('=')
+					if len(l) != 2:
+						print('配置文件中的接收收件列表配置不正确！')
+						result = False
+						break
+					self.emailList.append(l[1])
+			elif result:
+				l = line.split('=')
+				if len(l) != 2:
+					print('配置文件不正确！')
+					result = False
+					break;
+				self.config[l[0]] = l[1]
+
+		if not 'dir' in self.config:
+			result = False
+			print('配置文件不正确，没有配置日志文件！')
+		else:
+			self.path = self.config['dir']
+
+#		if not 'category' in self.config:
+#			self.category = 'JA'
+#		else:
+#			self.category = self.config['category']
+
+		return result
+
+	def serialize(self):
+		with open('.scribe.pickle','wb') as f:
+			pickle.dump(self.filelist, f)
+
+	def initScribeClient(self):
+		result = False
+		strError = ''
+		for hp in self.host_port:
+			socket = TSocket.TSocket(host=hp.host, port=int(hp.port))
+			transport = TTransport.TFramedTransport(socket)
+			try:
+				transport.open()
+				result = True
+				break
+			except Exception:
+				plainText = hp.host + ':' + hp.port + '出现故障，将连接另一个scribe服务器'
+				self.sendMail('scribe服务器不能连接上', plainText, '')
+				strError = strError + plainText + '\n'
+				print(plainText)
+														
+		if not result:
+			self.sendMail('所有scribe服务器不能连接', strError, '')
+			print('没有一个scribe服务器可以正常连接')
+			return False
+		else:
+			protocol = TBinaryProtocol.TBinaryProtocol(
+				trans=transport,
+				strictRead=False,
+				strictWrite=False)
+			self.client = scribe.Client(iprot=protocol, oprot=protocol)
+			return True
+
+	def sendMail(self, subject, plainText, htmlText):
+		authInfo = {}
+		authInfo['server'] = self.config['server']
+		authInfo['user'] = self.config['user']
+		authInfo['password'] = self.config['password']
+		fromAdd = self.config['sendmail']
+		print(fromAdd)
+		toAdd = self.emailList;
+		try:
+			sendEmail(authInfo, fromAdd, toAdd, subject, plainText, htmlText)
+		except Exception:
+			print('发送邮件失败，可能原因是邮件服务器不能正常连接')
+
+def handle(sc, conf):
+	result = 0
+	sc.readConfig(conf)
+	if not sc.initScribeClient():
+		return
+	
+	try:
+		if os.path.exists('.scribe.pickle'):
+			with open('.scribe.pickle', 'rb') as f:
+				sc.filelist = pickle.load(f)
+				sc.readHistoryLog()
+		else:
+			sc.filelist = {}		
+	except OSError, error:
+		pass
+    
+	category = time.strftime("%Y-%m-%d", time.localtime())
+
+	try:
+		sc.open()
+		for line in sc:
+			print(category + ':' + line)
+			try:
+				log_entry = scribe.LogEntry(category=category,message=line)
+			except TypeError:
+				scribe_fix_legacy()
+				log_entry = scribe.LogEntry(category=category,message=line)
+			try:
+				result = sc.client.Log(messages=[log_entry])
+			except Exception:
+				if not sc.initScribeClient():
+					break
+				else:
+					result = sc.client.Log(messages=[log_entry])
+
+			if result == scribe.ResultCode.OK:
+				pass
+			elif result == scribe.ResultCode.TRY_LATER:
+				raise Error('Scribe Error: TRY LATER')
+			else:
+				raise Error('Scribe Error: Unknown error code (%s)' % result)
+	finally:
+		sc.close()
+
+def scribe_fix_legacy():
+	global scribe
+	old_log_entry = scribe.LogEntry
+	
+	def new_log_entry(**kwargs):
+		return old_log_entry(kwargs)
+	scribe.LogEntry = new_log_entry
+ 
+class HostPort(object):
+	def __init__(self, host, port):
+		self.host = host
+		self.port = port
+
+if __name__ == '__main__':
+
+	conf = 'scribe.conf'
+	if len(sys.argv) > 1:
+		conf = sys.argv[1]
+	
+	sc = ScribeClient()
+
+	try:
+		handle(sc, conf)
+	except KeyboardInterrupt:
+		sys.exit(0)
+	except (Error, TTransportException), error:
+		print >> sys.stderr, error
+		sys.exit(1)
