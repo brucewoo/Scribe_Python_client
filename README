@@ -1,15 +1,23 @@
-dir=/home/brucewoo/python/test/test.log
-server=mail.360buy.com
-user=wuyouqiang@360buy.com
+1.This python client solve the following problem:
+(1)Solve the single point of failure
+(2)when splitting log file, may cause log data missing
+(3)Collection of historical log
+(4)After restarting the client can continue to collect logs, and from the beginning rather than the collection of
+(5)E-mail notification if a scribe server hang
+
+2.config file 
+dir=/home/brucewoo/python/test/test.log //Tracking log files
+server=mail.*****.com //E-mail server
+user=wuyouqiang@*******.com
 password=******
-sendmail=wuyouqiang@360buy.com
-<toemaillist>
-email=wuyouqiang@360buy.com
-email=liuqingpan@360buy.com
-email=yfyangfeng@360buy.com
+sendmail=wuyouqiang@*******.com
+<toemaillist> //E-mail notification list
+email=wuyouqiang@*******.com
+email=*****@*******.com
+email=*****@*******.com
 </toemaillist>
-<host_port>
-host_port=10.28.0.219:1463
-host_port=10.28.1.58:1463
-host_port=10.28.1.54:1463
+<host_port>   //scribe server list,
+host_port=10.28.0.***:1463 //IP:Port
+host_port=10.28.1.***:1463
+host_port=10.28.1.***:1463
 </host_port>
